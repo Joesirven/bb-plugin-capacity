@@ -12,7 +12,8 @@
     "branding": {
       "icon": "Gauge"
     },
-    "server": "./server.ts"
+    "server": "./server.ts",
+    "app": "./app.tsx"
   },
   "dependencies": {
     "zod": "^4.3.6"
