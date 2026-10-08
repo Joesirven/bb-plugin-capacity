@@ -2,6 +2,33 @@
 
 Admission control and overload warnings for the host a bb server runs on.
 
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph MON["MONITOR - samples every interval"]
+        direction TB
+        TH["Active + starting threads<br/>and their subagents"] --> S{"Thresholds<br/>critical, warnAtPercent"}
+        MEM["MemAvailable, load per core,<br/>event loop delay"] --> S
+    end
+    S -->|"strained"| W1["Logs: edge-triggered<br/>with recovery line"]
+    S -->|"strained"| W2["Realtime signal<br/>on the capacity channel"]
+    S -->|"strained"| W3["Agent instructions:<br/>queue, do not fan out"]
+    SP["bb capacity spawn /<br/>capacity_queue_agent"] --> R{"Host has room?"}
+    R -->|"yes"| GO["Thread starts now"]
+    R -->|"no"| Q[("Held queue - priority,<br/>then oldest-first")]
+    S -.->|"capacity returns,<br/>drainPerTick per sample"| Q
+    Q --> GO
+    S -->|"critical + enforcement on"| SHED["Stops opt-in classes<br/>bb capacity shed, resumable"]
+
+    classDef core fill:#005032,stroke:#0D1016,color:#FAFAF9
+    classDef store fill:#0D1016,stroke:#005032,color:#FAFAF9
+    classDef guard fill:#F5C518,stroke:#0D1016,color:#0D1016
+    class TH,MEM,SP,GO core
+    class Q store
+    class S,R,W1,W2,W3,SHED guard
+```
+
 ## Why it exists
 
 Each agent thread on a bb host is a provider bridge worker plus a provider
