@@ -13,6 +13,7 @@
 // enforcement mode is a backstop that stops work which started anyway.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { createMachineResolver, UNKNOWN_MACHINE_NAME } from "./src/machine.js";
 import { measureEventLoopLagMs, takeHostSample } from "./src/host-sample.js";
 import {
   admits,
@@ -59,11 +60,27 @@ export const rpcContract = defineRpcContract({
   status: { input: z.null(), output: readingShape },
 });
 
+/** What a thread on a machine the plugin cannot measure is told. */
+function noReadingText(machineName: string, serverName: string): string {
+  return (
+    `No reading for ${machineName}: bb does not report memory or load for machines other than the bb server (${serverName}), ` +
+    `so this machine's capacity cannot be judged and nothing here will be stopped or queued by the capacity plugin. ` +
+    `The server's own state is not shown because it does not apply to this thread. ` +
+    `Use "bb capacity status --server" to see the server.`
+  );
+}
+
+// The live bb build reads presentation.label; the installed SDK typings (0.4.8) predate it.
+function withPresentation(pending: string, completed: string): object {
+  return { presentation: { label: { pending, completed } } };
+}
+
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define(SETTING_DESCRIPTORS);
   const database = bb.storage.database();
   bb.storage.migrate(database, MIGRATIONS);
   const store = new CapacityStore(database);
+  const machines = createMachineResolver(bb.sdk as never);
 
   /**
    * The most recent reading, kept in memory because two callers need it
@@ -78,8 +95,13 @@ export default async function plugin(bb: BbPluginApi) {
     return parseSettings((await settings.get()) as Record<string, unknown>);
   }
 
-  /** Agents occupying a slot: active or starting threads plus their subagents. */
+  /**
+   * Agents occupying a slot on the server: active or starting threads plus
+   * their subagents. Threads on other machines use no server slots; threads not
+   * yet placed on a machine are still counted, the conservative choice.
+   */
   async function countAgents(): Promise<AgentCount> {
+    const server = await machines.serverHost();
     const threads = await bb.sdk.threads.list({
       includeHidden: true,
       archived: false,
@@ -89,6 +111,8 @@ export default async function plugin(bb: BbPluginApi) {
     let backgroundAgents = 0;
     for (const thread of threads) {
       if (!OCCUPYING_STATUSES.has(thread.status)) continue;
+      const placedOn = thread.environmentHostId ?? null;
+      if (placedOn !== null && server.id !== null && placedOn !== server.id) continue;
       activeThreads += 1;
       backgroundAgents += thread.activity.activeBackgroundAgentCount;
     }
@@ -224,6 +248,9 @@ export default async function plugin(bb: BbPluginApi) {
   // already critical. Threads this plugin released are never shed: they were
   // admitted deliberately, and churning them would waste the slot.
   bb.events.on("thread.active", async ({ thread }) => {
+    // Fill the thread-to-machine cache first, so the instruction contributor
+    // knows this thread even when enforcement returns early below.
+    void machines.machineOf(thread.id, thread.environmentId).catch(() => {});
     try {
       const limits = await readSettings();
       if (limits.enforcement === "off") return;
@@ -235,14 +262,30 @@ export default async function plugin(bb: BbPluginApi) {
         thread.parentThreadId !== null;
       if (limits.enforcement === "background-only" && !isBackground) return;
 
+      const [server, machine] = await Promise.all([
+        machines.serverHost(),
+        machines.machineOf(thread.id, thread.environmentId),
+      ]);
+      if (server.id === null || machine.hostId !== server.id) {
+        bb.log.info(
+          `not judged: no reading for ${machine.hostName ?? machine.hostId ?? "an unknown machine"} (thread ${thread.id})`,
+        );
+        return;
+      }
+
       const reading = await refresh();
       if (reading.level !== "critical") return;
 
-      const reason = reading.breached.join("; ");
+      const rule = reading.breached.join("; ");
       await bb.sdk.threads.stop({ threadId: thread.id });
-      store.recordShed(thread.id, reason, Date.now());
+      store.recordShed(thread.id, rule, Date.now(), {
+        machineId: server.id,
+        machineName: server.name,
+        reading: describe(reading),
+        rule,
+      });
       bb.log.warn(
-        `stopped thread ${thread.id} on a critical host — ${reason}. ` +
+        `capacity plugin stopped thread ${thread.id} on ${server.name} (${server.id}): ${rule}. ` +
           `Resume it from the thread when capacity returns.`,
       );
       publish(reading, "shed");
@@ -257,14 +300,25 @@ export default async function plugin(bb: BbPluginApi) {
 
   // The warning channel that reaches the thing actually causing the overload.
   // Synchronous and on the thread-start path, so it only reads cached state.
-  bb.agents.contributeInstructions(() => {
+  bb.agents.contributeInstructions((ctx) => {
     const reading = latest;
     if (!reading || reading.level === "ok") return null;
+    const serverId = machines.cachedServer()?.id ?? null;
+    const known = machines.cachedHost(ctx.threadId);
+    if (known !== undefined && known !== serverId) return null;
+    if (known === undefined) {
+      // Not resolved yet: warn about the server now, fill the cache for next time.
+      void machines.machineOf(ctx.threadId).catch(() => {});
+    }
+    const subject =
+      known === undefined
+        ? `The bb server machine ${machines.cachedServer()?.name ?? ""}`.trim()
+        : "this bb host";
     const reasons = [...reading.breached, ...reading.strained].join("; ");
     const verb =
       reading.level === "critical" ? "cannot take" : "is close to not taking";
     return [
-      `Host capacity warning: this bb host ${verb} more agent work right now.`,
+      `Host capacity warning: ${subject} ${verb} more agent work right now.`,
       `Current state: ${reasons}.`,
       reading.level === "critical"
         ? "Do not spawn threads, subagents, or workflows until this clears. Queue the work instead with `bb capacity spawn`, which starts it when the host recovers."
@@ -279,16 +333,22 @@ export default async function plugin(bb: BbPluginApi) {
       "Report whether the bb host has room to run more agents right now. Call this before spawning threads, subagents, or workflows.",
     instructions:
       "Before fanning out agent work, call capacity_check. If it reports critical, queue the work with capacity_queue_agent instead of spawning directly.",
-    presentation: {
-      label: {
-        pending: "Checking host capacity",
-        completed: "Checked host capacity",
-      },
-    },
+    ...withPresentation("Checking host capacity", "Checked host capacity"),
     parameters: z.object({}),
-    async execute() {
+    async execute(_params, ctx) {
+      const server = await machines.serverHost();
+      if (ctx.threadId) {
+        const machine = await machines.machineOf(ctx.threadId);
+        if (server.id === null || machine.hostId !== server.id) {
+          return noReadingText(
+            machine.hostName ?? machine.hostId ?? UNKNOWN_MACHINE_NAME,
+            server.name,
+          );
+        }
+      }
       const reading = await refresh();
       return [
+        `Machine: ${server.name} (the bb server).`,
         describe(reading),
         `Free agent slots: ${reading.slotsFree}.`,
         `Queued agents waiting: ${store.queuedCount()}.`,
@@ -303,12 +363,7 @@ export default async function plugin(bb: BbPluginApi) {
     name: "capacity_queue_agent",
     description:
       "Queue a bb thread to start when the host has capacity. Starts immediately when there is room, otherwise waits in line. Use this instead of spawning threads directly when the host is under load.",
-    presentation: {
-      label: {
-        pending: "Queueing an agent",
-        completed: "Queued an agent",
-      },
-    },
+    ...withPresentation("Queueing an agent", "Queued an agent"),
     parameters: z.object({
       prompt: z.string().min(1).describe("The prompt the queued thread starts with."),
       title: z.string().optional().describe("Optional thread title."),
@@ -393,7 +448,7 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "status",
         summary: "Current capacity reading, limits, and queue depth.",
-        usage: "bb capacity status [--json]",
+        usage: "bb capacity status [--server] [--json]",
       },
       {
         name: "queue",
@@ -445,11 +500,28 @@ export default async function plugin(bb: BbPluginApi) {
 
       switch (command) {
         case "status": {
+          const server = await machines.serverHost();
+          if (ctx.threadId && !flagPresent(parsed, "server")) {
+            const machine = await machines.machineOf(ctx.threadId);
+            if (server.id === null || machine.hostId !== server.id) {
+              const name = machine.hostName ?? machine.hostId ?? UNKNOWN_MACHINE_NAME;
+              const note = noReadingText(name, server.name);
+              if (wantsJson) {
+                return json({
+                  machine: { id: machine.hostId, name: machine.hostName ?? name },
+                  reading: null,
+                  note,
+                });
+              }
+              return { exitCode: 0, stdout: `${note}\n` };
+            }
+          }
           const reading = await refresh();
           const configured = await readSettings();
           const queueDepth = store.queuedCount();
           if (wantsJson) {
             return json({
+              machine: { id: server.id, name: server.name },
               level: reading.level,
               agentLoad: reading.agentLoad,
               slotsFree: reading.slotsFree,
@@ -462,6 +534,7 @@ export default async function plugin(bb: BbPluginApi) {
             });
           }
           const lines = [
+            `Machine: ${server.name} (the bb server)`,
             describe(reading),
             `Agent slots free: ${reading.slotsFree} of ${reading.limits.maxActiveAgents}`,
             `Threads active or starting: ${reading.count.activeThreads}; their subagents: ${reading.count.backgroundAgents}`,
@@ -609,7 +682,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           const lines = rows.map(
             (row) =>
-              `${new Date(row.shedAt).toISOString()}  ${row.threadId}  ${row.reason}`,
+              `${new Date(row.shedAt).toISOString()}  ${row.threadId}  ${row.machineName ?? "unknown"}  ${row.rule ?? row.reason}`,
           );
           return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
         }
@@ -656,6 +729,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(() => {
     latest = null;
     openWarning = null;
+    machines.clear();
   });
 
   bb.log.info("capacity monitor registered");

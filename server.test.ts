@@ -34,10 +34,22 @@ const RESOURCE_LIMITS_DISABLED = {
   maxEventLoopLagMs: "60000",
 };
 
+const SERVER_HOST = "host_qyafx7sgny";
+const OMASHU_HOST = "host_na8kye9eas";
+
+/** An environment id that carries its host, so the stub can resolve it back. */
+const environmentOn = (hostId: string) => `env_on_${hostId}`;
+
 async function loadPlugin(options: {
   settings?: Record<string, string>;
   threads?: unknown[];
   spawn?: (args: unknown) => unknown;
+  /** Host of each thread id by `threads.get`; threads not listed run on the server. */
+  hostOfThread?: Record<string, string>;
+  /** Make every environment lookup fail. */
+  environmentFails?: boolean;
+  /** Make `threads.get` report no environment, as for a thread not yet placed. */
+  environmentless?: boolean;
 }): Promise<FakePluginHost> {
   const host = createFakePluginHost({
     pluginId: "capacity",
@@ -48,7 +60,30 @@ async function loadPlugin(options: {
         spawn:
           options.spawn ??
           (async () => makeThreadResponse({ id: "thr_spawned" }) as never),
+        get: async ({ threadId }: { threadId: string }) => {
+          if (options.environmentFails) throw new Error("no such thread");
+          return makeThreadResponse({
+            id: threadId,
+            environmentId: options.environmentless
+              ? null
+              : environmentOn(options.hostOfThread?.[threadId] ?? SERVER_HOST),
+          }) as never;
+        },
         stop: async () => ({ ok: true }) as never,
+      },
+      system: { config: async () => ({ primaryHostId: SERVER_HOST }) as never },
+      hosts: {
+        list: async () =>
+          [
+            { id: SERVER_HOST, name: "ba-sing-se", status: "online" },
+            { id: OMASHU_HOST, name: "Omashu", status: "online" },
+          ] as never,
+      },
+      environments: {
+        get: async ({ environmentId }: { environmentId: string }) => {
+          if (options.environmentFails) throw new Error("no such environment");
+          return { id: environmentId, hostId: environmentId.replace("env_on_", "") } as never;
+        },
       },
     },
   });
@@ -411,7 +446,11 @@ describe("enforcement", () => {
 
   async function activate(host: FakePluginHost, thread: Record<string, unknown>) {
     await host.harness.emitThreadEvent("thread.active", {
-      thread: makeThreadResponse({ id: "thr_new", ...thread }),
+      thread: makeThreadResponse({
+        id: "thr_new",
+        environmentId: environmentOn(SERVER_HOST),
+        ...thread,
+      }),
     });
   }
 
@@ -484,5 +523,183 @@ describe("the monitor service", () => {
 
     const history = JSON.parse((await host.harness.runCli(["history", "--json"])).stdout);
     expect(history.length).toBeGreaterThan(0);
+  });
+});
+
+describe("judging each thread by its own machine", () => {
+  const critical = { maxActiveAgents: "1" };
+  const activateOn = (host: FakePluginHost, environmentId: string | null) =>
+    host.harness.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({
+        id: "thr_new",
+        visibility: "hidden",
+        environmentId,
+      }),
+    });
+
+  for (const enforcement of ["all", "background-only"]) {
+    it(`does not stop or record a thread on Omashu (${enforcement})`, async () => {
+      const host = await loadPlugin({
+        settings: { ...critical, enforcement },
+        threads: [listRow()],
+      });
+      await activateOn(host, environmentOn(OMASHU_HOST));
+      expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
+      const shed = JSON.parse((await host.harness.runCli(["shed", "--json"])).stdout);
+      expect(shed).toEqual([]);
+      expect(
+        host.harness.logEntries.some(
+          (entry) => entry.level === "info" && entry.message.includes("not judged: no reading for Omashu"),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it("stops a server thread and records the machine, reading, and rule", async () => {
+    const host = await loadPlugin({
+      settings: { ...critical, enforcement: "all" },
+      threads: [listRow()],
+    });
+    await activateOn(host, environmentOn(SERVER_HOST));
+    expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(1);
+    const [row] = JSON.parse((await host.harness.runCli(["shed", "--json"])).stdout);
+    expect(row.machineId).toBe(SERVER_HOST);
+    expect(row.machineName).toBe("ba-sing-se");
+    expect(row.reading).toContain("critical");
+    expect(row.rule).toBe(row.reason);
+    expect(row.rule.length).toBeGreaterThan(0);
+    expect(
+      host.harness.logEntries.some((entry) =>
+        entry.message.includes(`capacity plugin stopped thread thr_new on ba-sing-se (${SERVER_HOST})`),
+      ),
+    ).toBe(true);
+    const text = (await host.harness.runCli(["shed"])).stdout;
+    expect(text).toContain("thr_new");
+    expect(text).toContain("ba-sing-se");
+  });
+
+  it("never stops a thread whose machine is unknown", async () => {
+    for (const environmentId of [null, environmentOn("host_x")]) {
+      const host = await loadPlugin({
+        settings: { ...critical, enforcement: "all" },
+        threads: [listRow()],
+        environmentFails: true,
+      });
+      await activateOn(host, environmentId);
+      expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
+    }
+  });
+
+  it("never stops a thread with no environment while the lookup works", async () => {
+    const host = await loadPlugin({
+      settings: { ...critical, enforcement: "all" },
+      threads: [listRow()],
+      environmentless: true,
+    });
+    await activateOn(host, null);
+    expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
+  });
+
+  it("never stops a thread whose host is not in the host list", async () => {
+    const host = await loadPlugin({
+      settings: { ...critical, enforcement: "all" },
+      threads: [listRow()],
+    });
+    await activateOn(host, environmentOn("host_unlisted"));
+    expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
+  });
+
+  it("capacity_check gives Omashu a no-reading answer without the server's numbers", async () => {
+    const host = await loadPlugin({
+      settings: critical,
+      threads: [listRow()],
+      hostOfThread: { thr_omashu: OMASHU_HOST },
+    });
+    const text = String(
+      await host.harness.callAgentTool("capacity_check", {}, { threadId: "thr_omashu" }),
+    );
+    expect(text).toContain("No reading for Omashu");
+    expect(text).toContain('Use "bb capacity status --server"');
+    expect(text).not.toContain("agents,");
+    expect(text).not.toContain("MB memory");
+  });
+
+  it("capacity_check gives a server thread the normal reading", async () => {
+    const host = await loadPlugin({ settings: critical, threads: [listRow()] });
+    const text = String(
+      await host.harness.callAgentTool("capacity_check", {}, { threadId: "thr_server" }),
+    );
+    expect(text).toContain("Machine: ba-sing-se (the bb server).");
+    expect(text).toContain("cannot take more agent work");
+  });
+
+  it("treats an unresolvable thread as an unknown machine", async () => {
+    const host = await loadPlugin({ environmentFails: true });
+    const text = String(
+      await host.harness.callAgentTool("capacity_check", {}, { threadId: "thr_lost" }),
+    );
+    expect(text).toContain("No reading for an unknown machine");
+  });
+
+  it("does not count an active Omashu thread against the server", async () => {
+    const host = await loadPlugin({
+      settings: { maxActiveAgents: "8" },
+      threads: [
+        listRow({ id: "thr_s", environmentHostId: SERVER_HOST }),
+        listRow({ id: "thr_o", environmentHostId: OMASHU_HOST }),
+        listRow({ id: "thr_unplaced", environmentHostId: null }),
+      ],
+    });
+    const status = JSON.parse((await host.harness.runCli(["status", "--json"])).stdout);
+    expect(status.count.activeThreads).toBe(2);
+  });
+
+  it("status from an Omashu thread says no reading, and --server forces the server", async () => {
+    const host = await loadPlugin({
+      settings: { maxActiveAgents: "8" },
+      hostOfThread: { thr_omashu: OMASHU_HOST },
+    });
+    const ctx = { threadId: "thr_omashu" };
+    const none = await host.harness.runCli(["status"], ctx);
+    expect(none.exitCode).toBe(0);
+    expect(none.stdout).toContain("No reading for Omashu");
+    const noneJson = JSON.parse((await host.harness.runCli(["status", "--json"], ctx)).stdout);
+    expect(noneJson.reading).toBeNull();
+    expect(noneJson.machine).toEqual({ id: OMASHU_HOST, name: "Omashu" });
+    expect(typeof noneJson.note).toBe("string");
+
+    const forced = await host.harness.runCli(["status", "--server"], ctx);
+    expect(forced.stdout.split("\n")[0]).toBe("Machine: ba-sing-se (the bb server)");
+    const forcedJson = JSON.parse(
+      (await host.harness.runCli(["status", "--server", "--json"], ctx)).stdout,
+    );
+    expect(forcedJson.machine).toEqual({ id: SERVER_HOST, name: "ba-sing-se" });
+    expect(forcedJson.level).toBeDefined();
+  });
+
+  it("contributes no instructions for a known Omashu thread", async () => {
+    const host = await loadPlugin({
+      settings: critical,
+      threads: [listRow()],
+      hostOfThread: { thr_omashu: OMASHU_HOST },
+    });
+    await host.harness.runCli(["status"]);
+    await host.harness.callAgentTool("capacity_check", {}, { threadId: "thr_omashu" });
+    const provider = host.harness.registrations.instructionProvider!;
+    expect(provider({ threadId: "thr_omashu", projectId: "proj_1" })).toBeNull();
+  });
+
+  it("scopes the warning to the server for a thread not yet resolved, then resolves it", async () => {
+    const host = await loadPlugin({
+      settings: critical,
+      threads: [listRow()],
+      hostOfThread: { thr_omashu: OMASHU_HOST },
+    });
+    await host.harness.runCli(["status"]);
+    const provider = host.harness.registrations.instructionProvider!;
+    const first = provider({ threadId: "thr_omashu", projectId: "proj_1" })!;
+    expect(first).toContain("The bb server machine ba-sing-se");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(provider({ threadId: "thr_omashu", projectId: "proj_1" })).toBeNull();
   });
 });

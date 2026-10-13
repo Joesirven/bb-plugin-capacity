@@ -98,6 +98,20 @@ running thread loses the turn in progress, so the other two modes are opt-in.
 Stopped threads are listed by `bb capacity shed` and can be resumed from the
 thread itself.
 
+## Which machine is judged
+
+The plugin measures only the machine the bb server runs on. bb does not report
+memory or load for any other machine, so a thread on another machine (for
+example Omashu) gets a "no reading" answer from `capacity_check` and
+`bb capacity status`, is never stopped, and does not use up the server's agent
+slots. A thread whose machine cannot be determined is treated the same way:
+never stopped. `bb capacity status --server` shows the server's reading from
+anywhere.
+
+When enforcement stops a thread, the reason shown on the thread is bb's own
+("Stopped manually"); bb allows no other reason. The plugin's own record is
+`bb capacity shed`, which lists the time, thread, machine, reading, and rule.
+
 ## Settings
 
 `bb plugin config capacity` lists all of them with their ranges. The ones that

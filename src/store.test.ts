@@ -122,8 +122,34 @@ describe("samples and warnings", () => {
   it("records threads enforcement stopped", () => {
     store.recordShed("thr_1", "out of memory", 5000);
     expect(store.recentShed(5)).toEqual([
-      { threadId: "thr_1", shedAt: 5000, reason: "out of memory" },
+      {
+        threadId: "thr_1",
+        shedAt: 5000,
+        reason: "out of memory",
+        machineId: null,
+        machineName: null,
+        reading: null,
+        rule: null,
+      },
     ]);
+  });
+});
+
+describe("shed machine detail", () => {
+  it("records the machine, the reading, and the rule", () => {
+    store.recordShed("thr_2", "memory low", 6000, {
+      machineId: "host_a",
+      machineName: "ba-sing-se",
+      reading: "critical: memory low",
+      rule: "memory low",
+    });
+    expect(store.recentShed(1)[0]).toMatchObject({
+      machineId: "host_a",
+      machineName: "ba-sing-se",
+      reading: "critical: memory low",
+      rule: "memory low",
+      reason: "memory low",
+    });
   });
 });
 

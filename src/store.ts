@@ -33,6 +33,19 @@ export interface WarningRow {
   clearedAt: number | null;
 }
 
+export interface ShedDetail {
+  machineId: string | null;
+  machineName: string | null;
+  reading: string | null;
+  rule: string | null;
+}
+
+export interface ShedRow extends ShedDetail {
+  threadId: string;
+  shedAt: number;
+  reason: string;
+}
+
 export const MIGRATIONS: string[] = [
   `CREATE TABLE IF NOT EXISTS queued_spawns (
      id TEXT PRIMARY KEY,
@@ -82,6 +95,10 @@ export const MIGRATIONS: string[] = [
      shed_at INTEGER NOT NULL,
      reason TEXT NOT NULL
    )`,
+  `ALTER TABLE shed_threads ADD COLUMN machine_id TEXT`,
+  `ALTER TABLE shed_threads ADD COLUMN machine_name TEXT`,
+  `ALTER TABLE shed_threads ADD COLUMN reading TEXT`,
+  `ALTER TABLE shed_threads ADD COLUMN rule TEXT`,
 ];
 
 interface QueueRecord {
@@ -338,23 +355,49 @@ export class CapacityStore {
     }));
   }
 
-  recordShed(threadId: string, reason: string, now: number): void {
+  recordShed(
+    threadId: string,
+    reason: string,
+    now: number,
+    detail: ShedDetail = { machineId: null, machineName: null, reading: null, rule: null },
+  ): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO shed_threads (thread_id, shed_at, reason)
-         VALUES (?, ?, ?)`,
+        `INSERT OR REPLACE INTO shed_threads
+           (thread_id, shed_at, reason, machine_id, machine_name, reading, rule)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(threadId, now, reason);
+      .run(
+        threadId,
+        now,
+        reason,
+        detail.machineId,
+        detail.machineName,
+        detail.reading,
+        detail.rule,
+      );
   }
 
-  recentShed(limit: number): Array<{ threadId: string; shedAt: number; reason: string }> {
+  recentShed(limit: number): ShedRow[] {
     const records = this.db
       .prepare(`SELECT * FROM shed_threads ORDER BY shed_at DESC LIMIT ?`)
-      .all(limit) as Array<{ thread_id: string; shed_at: number; reason: string }>;
+      .all(limit) as Array<{
+      thread_id: string;
+      shed_at: number;
+      reason: string;
+      machine_id: string | null;
+      machine_name: string | null;
+      reading: string | null;
+      rule: string | null;
+    }>;
     return records.map((record) => ({
       threadId: record.thread_id,
       shedAt: record.shed_at,
       reason: record.reason,
+      machineId: record.machine_id,
+      machineName: record.machine_name,
+      reading: record.reading,
+      rule: record.rule,
     }));
   }
 
