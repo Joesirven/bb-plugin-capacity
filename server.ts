@@ -279,9 +279,11 @@ export default async function plugin(bb: BbPluginApi) {
       "Report whether the bb host has room to run more agents right now. Call this before spawning threads, subagents, or workflows.",
     instructions:
       "Before fanning out agent work, call capacity_check. If it reports critical, queue the work with capacity_queue_agent instead of spawning directly.",
-    experimental_statusLabels: {
-      pending: "Checking host capacity",
-      completed: "Checked host capacity",
+    presentation: {
+      label: {
+        pending: "Checking host capacity",
+        completed: "Checked host capacity",
+      },
     },
     parameters: z.object({}),
     async execute() {
@@ -301,9 +303,11 @@ export default async function plugin(bb: BbPluginApi) {
     name: "capacity_queue_agent",
     description:
       "Queue a bb thread to start when the host has capacity. Starts immediately when there is room, otherwise waits in line. Use this instead of spawning threads directly when the host is under load.",
-    experimental_statusLabels: {
-      pending: "Queueing an agent",
-      completed: "Queued an agent",
+    presentation: {
+      label: {
+        pending: "Queueing an agent",
+        completed: "Queued an agent",
+      },
     },
     parameters: z.object({
       prompt: z.string().min(1).describe("The prompt the queued thread starts with."),
